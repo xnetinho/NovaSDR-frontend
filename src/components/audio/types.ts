@@ -17,6 +17,7 @@ export type AudioUiSettings = {
 export type AudioWindow = { l: number; m: number; r: number };
 
 export type AudioDebugStats = {
+  wireCodec: number,
   packetsReceived: number;
   packetsDropped: number;
   currentLatencyMs: number;

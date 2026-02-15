@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Audio, AudioCodec } from '../../modules/novasdrdsp.js';
+import { OpusDecoder } from 'opus-decoder';
 import { decodeImaAdpcmMono } from '../../lib/imaAdpcm';
 import { useReconnectingWebSocket } from '../../lib/useReconnectingWebSocket';
 import { registerAudioResumer } from './audioGate';
@@ -45,16 +46,16 @@ type AudioWireFrame = {
   m: number;
   r: number;
   pwr: number;
-  payload: Uint8Array;
+  frames: Uint8Array[];
 };
 
 function parseAudioWireFrame(buf: ArrayBuffer): AudioWireFrame | null {
-  if (buf.byteLength < 36) return null;
+  if (buf.byteLength < 40) return null;
   const bytes = new Uint8Array(buf);
   if (bytes[0] !== 0x4e || bytes[1] !== 0x53 || bytes[2] !== 0x44 || bytes[3] !== 0x41) return null; // "NSDA"
 
   const version = bytes[4] ?? 0;
-  if (version !== 1) return null;
+  if (version !== 2) return null;
 
   const codec = bytes[5] ?? 0;
   const view = new DataView(buf);
@@ -63,8 +64,26 @@ function parseAudioWireFrame(buf: ArrayBuffer): AudioWireFrame | null {
   const m = view.getFloat64(20, true);
   const r = view.getInt32(28, true);
   const pwr = view.getFloat32(32, true);
-  const payload = bytes.subarray(36);
-  return { codec, frameNum, l, m, r, pwr, payload };
+
+  var pos = 36;
+  const numEncodedFrames = view.getUint16(pos, true);
+  pos += 2;
+  const frames = [];
+  for (let i = 0; i < numEncodedFrames; i++) {
+    if (pos + 2 > buf.byteLength) return null;
+    const len = view.getUint16(pos, true);
+    pos += 2;
+    if (pos + len > buf.byteLength) return null;
+    const oneFrame = bytes.subarray(pos, pos + len);
+    frames.push(oneFrame);
+    pos += len;
+  }
+
+  if (pos + 2 > buf.byteLength) return null;
+  const endmark = view.getUint16(pos, true);
+  if (endmark !== 0xaabb) return null;
+
+  return { codec, frameNum, l, m, r, pwr, frames };
 }
 
 
@@ -79,6 +98,11 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
   const decoderNeedsRebuildRef = useRef<boolean>(false);
   const lastNbRef = useRef<boolean | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const [audioSampleRate, setAudioSampleRate] = useState<number>(0);
+  const opusDecoderWasmRef = useRef<OpusDecoder<48000> | null>(null);
+  const opusDecoderNativeRef = useRef<AudioDecoder | null>(null);
+  const [audioDecoderNeedsRebuild, setAudioDecoderNeedsRebuild] = useState<boolean>(false);
+  const wireCodecForDebugStats = useRef<number>(0);
   const gainRef = useRef<GainNode | null>(null);
   const ctcssFilterRef = useRef<BiquadFilterNode | null>(null);
   const bassFilterRef = useRef<BiquadFilterNode | null>(null);
@@ -142,6 +166,7 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
 
   // Debug stats
   const [debugStats, setDebugStats] = useState<AudioDebugStats>({
+    wireCodec: 0,
     packetsReceived: 0,
     packetsDropped: 0,
     currentLatencyMs: 0,
@@ -318,8 +343,86 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
       }
     }
 
+    setAudioSampleRate(audioCtx.sampleRate);
     setNeedsUserGesture(audioCtx.state !== 'running');
   }, []);
+
+  useEffect(() => {
+    if (audioSampleRate !== 48000) return;
+    if (!audioDecoderNeedsRebuild && (opusDecoderNativeRef.current || opusDecoderWasmRef.current)) return;
+
+    try {
+      opusDecoderNativeRef.current?.close();
+    } catch {
+      // ignore
+    }
+    opusDecoderNativeRef.current = null;
+    try {
+      opusDecoderWasmRef.current?.free();
+    } catch {
+      // ignore
+    }
+    opusDecoderWasmRef.current = null;
+
+    const probeCreateWasmOpusDecoder = () => {
+      const opusDecoder = new OpusDecoder<48000>({ "channels": 1, "sampleRate": 48000 });
+      (async () => {
+        await opusDecoder.ready;
+        opusDecoderWasmRef.current = opusDecoder;
+        setAudioDecoderNeedsRebuild(false);
+      })();
+    }
+
+    const audioDecoderOnError = (_e: DOMException) => {
+      packetsDroppedRef.current += 1;
+
+      const audioDecoder = opusDecoderNativeRef.current;
+      if (!audioDecoder) return;
+
+      if (audioDecoder.state !== 'closed') {
+        audioDecoder.reset();
+      }
+      setAudioDecoderNeedsRebuild(true);
+    }
+
+    const audioDecoderOnData = (data: AudioData) => {
+      const decoder = decoderRef.current;
+      const ctx = audioCtxRef.current;
+      const gain = gainRef.current;
+      if (!decoder || !ctx || !gain) return;
+
+      const size = data.allocationSize({ "planeIndex": 0 });
+      const buf = new ArrayBuffer(size);
+      data.copyTo(buf, { "planeIndex": 0, "format": "f32-planar" });
+      var raw_pcm = new Float32Array(buf, 0, data.numberOfFrames);
+      audioPrePump(ctx, gain, decoder, raw_pcm);
+    }
+
+    // probe to create native Opus decoder first and in unsuccess case create Wasm version
+    if ('AudioDecoder' in window) {
+      const nativeAudioDecoder = new AudioDecoder({
+        "error": audioDecoderOnError,
+        "output": audioDecoderOnData
+      });
+      const params = {
+        codec: "opus",
+        sampleRate: 48000,
+        numberOfChannels: 1,
+      };
+      (async () => {
+        const r = await AudioDecoder.isConfigSupported(params);
+        if (r.supported) {
+          nativeAudioDecoder.configure(r.config!);
+          opusDecoderNativeRef.current = nativeAudioDecoder;
+          setAudioDecoderNeedsRebuild(false);
+        } else {
+          probeCreateWasmOpusDecoder();
+        }
+      })();
+    } else {
+      probeCreateWasmOpusDecoder();
+    }
+  }, [audioSampleRate, audioDecoderNeedsRebuild]);
 
   const pumpAudio = useCallback(
     (ctx: AudioContext, gain: GainNode) => {
@@ -557,6 +660,43 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
     [],
   );
 
+  const audioPrePump = useCallback((ctx: AudioContext, gain: GainNode, decoder: Audio, raw_pcm: Float32Array<ArrayBufferLike>) => {
+    let decoded: Float32Array | null = null;
+    try {
+      decoded = raw_pcm.length > 0 ? (decoder.process_pcm_f32(raw_pcm) as Float32Array) : null;
+    } catch {
+      // If the decoder panics/traps, try a one-time rebuild and let the stream continue.
+      decoderNeedsRebuildRef.current = true;
+      decoded = null;
+      packetsDroppedRef.current += 1;
+    }
+    if (!decoded) return;
+
+    const pcm = new Float32Array(decoded);
+    if (pcm.length === 0) {
+      setStatus('ready');
+      setError(null);
+      return;
+    }
+
+    // Optional decoder tap (no transfer; keep playback intact).
+    try {
+      const sr = ctx.sampleRate;
+      const cb = onPcmRef.current;
+      if (cb && Number.isFinite(sr) && sr > 0) cb(pcm, sr);
+    } catch {
+      // ignore
+    }
+
+    pcmQueueRef.current.push(pcm);
+    pcmQueuedSamplesRef.current += pcm.length;
+    pumpAudio(ctx, gain);
+
+    setStatus('ready');
+    setError(null);
+
+  }, [pumpAudio]);
+
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       if (typeof event.data === 'string') {
@@ -574,10 +714,12 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
             // ignore
           }
           setBasicInfo(raw);
+          const isOpus = raw.audio_compression === 'opus';
           smeterOffsetDbRef.current = typeof raw.smeter_offset === 'number' ? raw.smeter_offset : 0;
-
           const outputSps = Math.max(1, Math.round(raw.audio_max_sps));
-          ensureAudioGraph(outputSps);
+          const adjustedOutputSps = (isOpus) ? 48000 : outputSps;
+
+          ensureAudioGraph(adjustedOutputSps);
           const ctx = audioCtxRef.current;
           if (!ctx) return;
           pcmQueueRef.current = [];
@@ -602,6 +744,9 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
           const fftSize = raw.fft_result_size * (raw.total_bandwidth === raw.sps / 2 ? 2 : 1);
           const trueAudioSps = Math.max(1, Math.round((raw.audio_max_fft / fftSize) * raw.sps));
 
+          const adjustedTrueAudioSps = (isOpus) ? trueAudioSps * 48000 / raw.audio_max_sps : trueAudioSps;
+          const adjustedOutputSampleRate = (isOpus) ? 48000 : ctx.sampleRate;
+
           try {
             decoderRef.current?.free();
           } catch {
@@ -610,10 +755,10 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
           decoderConfigRef.current = {
             codec,
             codecRate: raw.audio_max_sps,
-            inputRate: trueAudioSps,
-            outputRate: ctx.sampleRate,
+            inputRate: adjustedTrueAudioSps,
+            outputRate: adjustedOutputSampleRate,
           };
-          decoderRef.current = new Audio(codec, raw.audio_max_sps, trueAudioSps, ctx.sampleRate);
+          decoderRef.current = new Audio(codec, raw.audio_max_sps, adjustedTrueAudioSps, adjustedOutputSampleRate);
           const current = settingsRef.current;
           desiredDspRef.current = { nr: current.nr, nb: current.nb, an: current.an };
           decoderRef.current.set_nr(current.nr);
@@ -642,7 +787,7 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
         m: wire.m,
         r: wire.r,
         pwr: wire.pwr,
-        data: wire.payload,
+        frames: wire.frames,
       };
 
       packetsReceivedRef.current += 1;
@@ -694,41 +839,36 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
         }
       }
 
-      let decoded: Float32Array | null = null;
-      try {
-        if (wire.codec !== 1) return;
-        const pcm = decodeImaAdpcmMono(audioPkt.data);
-        decoded = pcm.length > 0 ? (decoder.process_pcm_f32(pcm) as Float32Array) : null;
-      } catch {
-        // If the decoder panics/traps, try a one-time rebuild and let the stream continue.
-        decoderNeedsRebuildRef.current = true;
-        decoded = null;
-        packetsDroppedRef.current += 1;
-      }
-      if (!decoded) return;
+      wireCodecForDebugStats.current = wire.codec;
 
-      const pcm = new Float32Array(decoded);
-      if (pcm.length === 0) {
-        setStatus('ready');
-        setError(null);
-        return;
-      }
-
-      // Optional decoder tap (no transfer; keep playback intact).
+      let raw_pcm: Float32Array | null = null;
       try {
-        const sr = ctx.sampleRate;
-        const cb = onPcmRef.current;
-        if (cb && Number.isFinite(sr) && sr > 0) cb(pcm, sr);
+        if (wire.codec === 1) {
+          const frames = audioPkt.frames.map(x => decodeImaAdpcmMono(x));
+          raw_pcm = combineFrames(frames);
+        } else if (wire.codec === 2 && opusDecoderNativeRef.current) {
+          for (const frame of audioPkt.frames) {
+            const chunk = new EncodedAudioChunk({ "data": frame, "type": "key", "timestamp": 0 });
+            opusDecoderNativeRef.current.decode(chunk);
+          }
+          return;
+        } else if (wire.codec === 2 && opusDecoderWasmRef.current) {
+          const frames = audioPkt.frames
+            .map(x => {
+              const d = opusDecoderWasmRef.current!.decodeFrame(x);
+              return d.channelData[0];
+            })
+            .filter(x => x.length > 0);
+          raw_pcm = combineFrames(frames);
+        } else {
+          return;
+        }
       } catch {
         // ignore
+        packetsDroppedRef.current += 1;
+        return;
       }
-
-      pcmQueueRef.current.push(pcm);
-      pcmQueuedSamplesRef.current += pcm.length;
-      pumpAudio(ctx, gain);
-
-      setStatus('ready');
-      setError(null);
+      audioPrePump(ctx, gain, decoder, raw_pcm);
     };
     messageHandlerRef.current = handleMessage;
 
@@ -877,6 +1017,7 @@ export function useAudioClient({ receiverId, receiverSessionNonce, mode, centerH
       const bufferHealth = Math.min(1, currentLatencyMs / (targetLeadSecRef.current * 1000));
 
       setDebugStats({
+        wireCodec: wireCodecForDebugStats.current,
         packetsReceived: packetsReceivedRef.current,
         packetsDropped: packetsDroppedRef.current,
         currentLatencyMs: Math.round(currentLatencyMs),
@@ -939,4 +1080,15 @@ function normalizeAudioWindow(info: BasicInfo, w: AudioWindow): AudioWindow {
     r = l + maxSpan;
   }
   return { l, m, r };
+}
+
+function combineFrames(frames: Float32Array[]): Float32Array {
+  const totalElements = frames.reduce((acc, x) => acc + x.length, 0);
+  const res = new Float32Array(totalElements);
+  let pos = 0;
+  for (const frame of frames) {
+    res.set(frame, pos);
+    pos += frame.length;
+  }
+  return res;
 }
