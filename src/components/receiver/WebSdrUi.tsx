@@ -6,6 +6,7 @@ import { DemodBandwidthPanel } from './panels/DemodBandwidthPanel';
 import { ServerInfoPanel } from './panels/ServerInfoPanel';
 import { WaterfallControlsPanel } from './panels/WaterfallControlsPanel';
 import { WaterfallCard } from '../waterfall/WaterfallCard';
+import type { ColormapName } from '../waterfall/colormaps';
 import type { WaterfallDisplaySettings } from '../waterfall/viewSettings';
 import type { AudioDebugStats, AudioUiSettings } from '../audio/types';
 import { triggerAudioResume } from '../audio/audioGate';
@@ -22,6 +23,7 @@ type Props = {
   onAudioSettingsChange: React.Dispatch<React.SetStateAction<AudioUiSettings>>;
   tuningStepHz: number;
   onDebugStatsChange: React.Dispatch<React.SetStateAction<AudioDebugStats | null>>;
+  onCenterHzChange?: (hz: number | null) => void;
   autoBandMode: boolean;
   onPreferReceiverForFrequencyHz?: (hz: number) => string | null;
   initialUrlTune?: { receiverId: string; frequencyHz: number | null; mode: ReceiverMode | null } | null;
@@ -35,6 +37,7 @@ export function WebSdrUi({
   onAudioSettingsChange,
   tuningStepHz,
   onDebugStatsChange,
+  onCenterHzChange,
   autoBandMode,
   onPreferReceiverForFrequencyHz,
   initialUrlTune,
@@ -43,6 +46,10 @@ export function WebSdrUi({
   const [mode, setMode] = useState<'USB' | 'LSB' | 'CW' | 'AM' | 'FM' | 'FMC' | 'WBFM' | 'SAM'>('USB');
   const [centerHz, setCenterHz] = useState<number | null>(null);
   const [bandwidthHz, setBandwidthHz] = useState<number | null>(null);
+
+  useEffect(() => {
+    onCenterHzChange?.(centerHz);
+  }, [centerHz, onCenterHzChange]);
   const [gridLocator, setGridLocator] = useState<string | null>(null);
   const [viewport, setViewport] = useState<{ l: number; r: number } | null>(null);
   const [audioMaxSps, setAudioMaxSps] = useState<number | null>(null);
@@ -72,7 +79,8 @@ export function WebSdrUi({
     passband: { l: number; m: number; r: number } | null;
     viewport: { l: number; r: number } | null;
   }>({ mode, centerHz, bandwidthHz, passband: audioWindow, viewport });
-  const vfoARef = useRef<{
+  const catsyncNotifyRef = useRef<{ hz: number | null; mode: typeof mode | null }>({ hz: null, mode: null });
+  const vfoARef = useRef<{ 
     mode: typeof mode;
     centerHz: number;
     bandwidthHz: number | null;
@@ -106,6 +114,7 @@ export function WebSdrUi({
   const pendingExplicitTuneRef = useRef<null | { hz: number; mode: typeof mode; receiverId: string }>(null);
   const waterfallSettingsRef = useRef<WaterfallSettings | null>(null);
   const initialUrlTuneAppliedRef = useRef(false);
+  const allowedColormapsRef = useRef<ColormapName[]>(['gqrx', 'rainbow', 'viridis', 'twentev2']);
 
   useEffect(() => {
     preferReceiverRef.current = onPreferReceiverForFrequencyHz;
@@ -167,8 +176,7 @@ export function WebSdrUi({
       const maxIdx = Math.max(0, Math.floor(fft));
 
       const cwBfoHz = 750;
-      const carrierHz = nextMode === 'CW' ? hz - cwBfoHz : hz;
-      const centerIdx = ((carrierHz - base) / bw) * fft;
+      const centerIdx = ((hz - base) / bw) * fft;
       if (!Number.isFinite(centerIdx)) return null;
 
       const ssbLowCutHzRaw = settings.defaults?.ssb_lowcut_hz ?? 100;
@@ -206,9 +214,6 @@ export function WebSdrUi({
         l = clampIdx(carrierIdx - ssbHighCutIdx);
         r = clampIdx(carrierIdx - ssbLowCutIdx);
       } else if (nextMode === 'CW') {
-        // CW uses a narrow, BFO-offset window:
-        // - `hz` is the tone center (what the user types/clicks)
-        // - `m` is the carrier (toneCenter - BFO)
         const toneCenter = carrierIdx + cwBfoIdx;
         l = clampIdx(toneCenter - spanIdx / 2);
         r = clampIdx(toneCenter + spanIdx / 2);
@@ -237,6 +242,7 @@ export function WebSdrUi({
       writeActiveVfo((v) => {
         v.mode = sanitized;
       });
+
 
       const settings = waterfallSettingsRef.current;
       const hz = liveRef.current.centerHz;
@@ -294,6 +300,121 @@ export function WebSdrUi({
     },
     [canWbfm, onReceiverChange, passbandForTune, receiverId, requestFrequencySetHz, setModeForActiveVfo],
   );
+
+  useEffect(() => {
+    const w = window as any;
+
+    const setfreqImpl = (hz: number) => {
+      const rounded = Math.round(Number(hz));
+      if (!Number.isFinite(rounded) || rounded <= 0) return false;
+      w.__catsync_state = w.__catsync_state || { hz: null, mode: null, requestedHz: null };
+      w.__catsync_state.requestedHz = rounded;
+      w.__catsync_state.hz = rounded;
+      tuneTo(rounded);
+      return true;
+    };
+
+    const setmodeImpl = (rawMode: string) => {
+      const normalized = String(rawMode || '').trim().toUpperCase();
+      const mapped =
+        normalized === 'WFM'
+          ? 'WBFM'
+          : normalized === 'NFM' || normalized === 'NBFM'
+            ? 'FM'
+            : normalized === 'CWU' || normalized === 'CWL'
+              ? 'CW'
+              : normalized === 'DIGU'
+                ? 'USB'
+                : normalized === 'DIGL'
+                  ? 'LSB'
+                  : normalized === 'DSB'
+                    ? 'AM'
+                    : normalized;
+
+      const nextMode: typeof mode =
+        mapped === 'USB' ||
+        mapped === 'LSB' ||
+        mapped === 'CW' ||
+        mapped === 'AM' ||
+        mapped === 'FM' ||
+        mapped === 'FMC' ||
+        mapped === 'WBFM' ||
+        mapped === 'SAM'
+          ? mapped
+          : 'USB';
+
+      w.__catsync_state = w.__catsync_state || { hz: null, mode: null, requestedHz: null };
+      w.__catsync_state.mode = nextMode;
+      setModeForActiveVfo(nextMode);
+      return true;
+    };
+
+    const zoomStepImpl = (action: any) => {
+      const toBand = w.ext_zoom?.TO_BAND;
+      const isToBand = action === toBand || action === 'TO_BAND' || action === 0;
+      if (!isToBand) return true;
+
+      const settings = waterfallSettingsRef.current;
+      if (!settings) return false;
+      const fft = Math.floor(Number(settings.fft_result_size) || 0);
+      if (!Number.isFinite(fft) || fft <= 0) return false;
+
+      viewportSetNonceRef.current += 1;
+      setViewportSet({ nonce: viewportSetNonceRef.current, l: 0, r: fft });
+      return true;
+    };
+
+    w.__catsync_setfreq_impl = setfreqImpl;
+    w.__catsync_setmode_impl = setmodeImpl;
+    w.__catsync_zoom_step_impl = zoomStepImpl;
+    if (typeof w.__catsync_flush === 'function') w.__catsync_flush();
+
+    return () => {
+      if (w.__catsync_setfreq_impl === setfreqImpl) delete w.__catsync_setfreq_impl;
+      if (w.__catsync_setmode_impl === setmodeImpl) delete w.__catsync_setmode_impl;
+      if (w.__catsync_zoom_step_impl === zoomStepImpl) delete w.__catsync_zoom_step_impl;
+    };
+  }, [setModeForActiveVfo, tuneTo]);
+
+  useEffect(() => {
+    const w = window as any;
+    if (!w.__catsync_state) return;
+
+    if (centerHz != null) w.__catsync_state.hz = Math.round(centerHz);
+    w.__catsync_state.mode = mode;
+
+    const nextHz = centerHz != null ? Math.round(centerHz) : null;
+    const nextMode = mode;
+    const last = catsyncNotifyRef.current;
+    const freqChanged = nextHz != null && nextHz !== last.hz;
+    const modeChanged = nextMode !== last.mode;
+
+    if (freqChanged || modeChanged) {
+      last.hz = nextHz;
+      last.mode = nextMode;
+      try {
+        if (typeof w.injection_environment_changed === 'function') {
+          console.debug('[NovaSDR CATsync] injection_environment_changed', { freqChanged, modeChanged, nextHz, nextMode });
+          w.injection_environment_changed({ freq: freqChanged, mode: modeChanged });
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const requestedHz = w.__catsync_state.requestedHz;
+    if (requestedHz != null && centerHz != null && Math.round(centerHz) === requestedHz) {
+      try {
+        const noop = w.__catsync_noop_freqset_complete;
+        if (typeof w.freqset_complete === 'function' && w.freqset_complete !== noop) {
+          w.freqset_complete();
+        }
+      } catch {
+        // ignore
+      }
+      w.__catsync_state.requestedHz = null;
+    }
+  }, [centerHz, mode]);
 
   useEffect(() => {
     if (!initialUrlTune || initialUrlTuneAppliedRef.current) return;
@@ -495,6 +616,7 @@ export function WebSdrUi({
           receiverId={receiverId}
           mode={mode}
           centerHz={centerHz}
+          audioMaxSps={audioMaxSps}
           onSetMode={setModeForActiveVfo}
           frequencyAdjust={frequencyAdjust}
           frequencySet={frequencySet}
@@ -554,6 +676,15 @@ export function WebSdrUi({
                   : null;
             if (defaultSquelch != null && !squelchTouchedRef.current) {
               onAudioSettingsChange((prev) => ({ ...prev, squelch: defaultSquelch }));
+            }
+            if (typeof d?.colormap === 'string' && d.colormap.trim().length > 0) {
+              const colormap = d.colormap.trim() as ColormapName;
+              if (allowedColormapsRef.current.includes(colormap)) {
+                setWaterfallDisplay((prev) => ({
+                  ...prev,
+                  colormap,
+                }));
+              }
             }
             const raw = (d?.modulation ?? 'USB').toUpperCase();
             const normalized =

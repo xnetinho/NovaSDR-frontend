@@ -215,6 +215,10 @@ export function SettingsDialog({
             </div>
             {debugStats ? (
               <div className="space-y-2 rounded-md border bg-muted/30 p-3 font-mono text-xs">
+                <DebugRow 
+                  label="Codec Name" 
+                  value={debugStats.wireCodec === 1 ? 'adpcm' : debugStats.wireCodec === 2 ? 'opus' : 'unknown'} 
+                />
                 <DebugRow label="Packets Received" value={debugStats.packetsReceived.toLocaleString()} />
                 <DebugRow
                   label="Packets Dropped"
