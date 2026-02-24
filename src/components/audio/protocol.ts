@@ -30,5 +30,5 @@ export type AudioPacket = {
   m: number;
   r: number;
   pwr: number;
-  data: Uint8Array;
+  frames: Uint8Array[];
 };
