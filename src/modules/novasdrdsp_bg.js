@@ -172,6 +172,28 @@ export class Audio {
         wasm.__wbg_audio_free(ptr, 0);
     }
     /**
+     * @param {Float32Array} input
+     * @returns {Float32Array}
+     */
+    process_pcm_f32(input) {
+        const ptr0 = passArrayF32ToWasm0(input, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.audio_process_pcm_f32(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
+     * @param {Function | null} [f]
+     */
+    set_decoded_callback(f) {
+        wasm.audio_set_decoded_callback(this.__wbg_ptr, isLikeNone(f) ? 0 : addToExternrefTable0(f));
+    }
+    /**
+     * @param {number} factor
+     */
+    set_relative_resample_ratio(factor) {
+        wasm.audio_set_relative_resample_ratio(this.__wbg_ptr, factor);
+    }
+    /**
      * @param {AudioCodec} codec
      * @param {number} _codec_rate
      * @param {number} input_rate
@@ -194,30 +216,10 @@ export class Audio {
         return ret;
     }
     /**
-     * @param {Uint8Array} input
-     * @returns {Float32Array}
+     * @param {boolean} an
      */
-    decode_to_pcm_f32(input) {
-        const ptr0 = passArray8ToWasm0(input, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.audio_decode_to_pcm_f32(this.__wbg_ptr, ptr0, len0);
-        return ret;
-    }
-    /**
-     * @param {Float32Array} input
-     * @returns {Float32Array}
-     */
-    process_pcm_f32(input) {
-        const ptr0 = passArrayF32ToWasm0(input, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.audio_process_pcm_f32(this.__wbg_ptr, ptr0, len0);
-        return ret;
-    }
-    /**
-     * @param {boolean} nr
-     */
-    set_nr(nr) {
-        wasm.audio_set_nr(this.__wbg_ptr, nr);
+    set_an(an) {
+        wasm.audio_set_an(this.__wbg_ptr, an);
     }
     /**
      * @param {boolean} nb
@@ -226,16 +228,10 @@ export class Audio {
         wasm.audio_set_nb(this.__wbg_ptr, nb);
     }
     /**
-     * @param {boolean} an
+     * @param {boolean} nr
      */
-    set_an(an) {
-        wasm.audio_set_an(this.__wbg_ptr, an);
-    }
-    /**
-     * @param {Function | null} [f]
-     */
-    set_decoded_callback(f) {
-        wasm.audio_set_decoded_callback(this.__wbg_ptr, isLikeNone(f) ? 0 : addToExternrefTable0(f));
+    set_nr(nr) {
+        wasm.audio_set_nr(this.__wbg_ptr, nr);
     }
 }
 if (Symbol.dispose) Audio.prototype[Symbol.dispose] = Audio.prototype.free;

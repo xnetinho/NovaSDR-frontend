@@ -34,7 +34,7 @@ export function BackendReconnectOverlay() {
   const [visible, setVisible] = useState(false);
   const hideTimerRef = useRef<number | null>(null);
 
-  const notConnected = useMemo(() => Object.entries(snapshot).filter(([, s]) => s.state !== 'connected'), [snapshot]);
+  const notConnected = useMemo(() => Object.entries(snapshot).filter(([src, s]) => s.state !== 'connected' && src !== 'chat'), [snapshot]);
   const shouldShow = everConnected && notConnected.length > 0;
   const connectionBadges = useMemo(() => {
     const entries = Object.entries(snapshot).sort(([a], [b]) => a.localeCompare(b));

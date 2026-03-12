@@ -4,14 +4,14 @@
 export class Audio {
   free(): void;
   [Symbol.dispose](): void;
+  process_pcm_f32(input: Float32Array): Float32Array;
+  set_decoded_callback(f?: Function | null): void;
+  set_relative_resample_ratio(factor: number): void;
   constructor(codec: AudioCodec, _codec_rate: number, input_rate: number, output_rate: number);
   decode(input: Uint8Array): Float32Array;
-  decode_to_pcm_f32(input: Uint8Array): Float32Array;
-  process_pcm_f32(input: Float32Array): Float32Array;
-  set_nr(nr: boolean): void;
-  set_nb(nb: boolean): void;
   set_an(an: boolean): void;
-  set_decoded_callback(f?: Function | null): void;
+  set_nb(nb: boolean): void;
+  set_nr(nr: boolean): void;
 }
 
 export enum AudioCodec {
